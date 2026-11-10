@@ -68,23 +68,28 @@ private final class AppObserver {
     }
 }
 
-/// Slides windows to their targets. Sizes are set once up front; only positions animate.
+/// Moves windows to their target frames. Position and size travel together on one spring
+/// curve, so neighbouring windows stay edge to edge the whole way instead of opening gaps.
 private final class Animator {
     struct Move {
         let window: ManagedWindow
-        let from: CGPoint
-        let to: CGPoint
-        let size: CGSize
+        let from: CGRect
+        let to: CGRect
         let animate: Bool
     }
 
     /// Called each time a window is placed, so overlays can follow it.
     var onPlace: ((ManagedWindow) -> Void)?
+    /// Called with the windows whose size was changed, once they have reached it.
+    var onResized: (([ManagedWindow]) -> Void)?
 
     private var moves: [Move] = []
+    private var resized: [ManagedWindow] = []
     private var timer: Timer?
     private var start = 0.0
     private var duration = 0.0
+
+    var isRunning: Bool { timer != nil }
 
     func run(_ new: [Move], duration: Double) {
         let incoming = Set(new.map(\.window.id))
@@ -93,13 +98,19 @@ private final class Animator {
         timer = nil
         moves = []
         for move in new {
-            if move.animate && duration > 0 && hypot(move.to.x - move.from.x, move.to.y - move.from.y) > 1 {
+            if abs(move.to.width - move.from.width) > 0.5 || abs(move.to.height - move.from.height) > 0.5 {
+                resized.append(move.window)
+            }
+            if move.animate && duration > 0 && distance(move) > 1 {
                 moves.append(move)
             } else {
                 place(move, 1)
             }
         }
-        guard !moves.isEmpty else { return }
+        guard !moves.isEmpty else {
+            settle()
+            return
+        }
         self.duration = duration
         start = CACurrentMediaTime()
         let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
@@ -111,20 +122,59 @@ private final class Animator {
         timer?.invalidate()
         timer = nil
         moves = []
+        resized = []
+    }
+
+    /// Jumps every window in flight to its target.
+    func finish() {
+        guard isRunning else { return }
+        timer?.invalidate()
+        timer = nil
+        for move in moves { place(move, 1) }
+        moves = []
+        settle()
+    }
+
+    private func settle() {
+        let done = resized
+        resized = []
+        if !done.isEmpty { onResized?(done) }
+    }
+
+    private func distance(_ move: Move) -> CGFloat {
+        max(abs(move.to.minX - move.from.minX), abs(move.to.minY - move.from.minY),
+            abs(move.to.width - move.from.width), abs(move.to.height - move.from.height))
+    }
+
+    /// An under-damped spring from 0 to 1: it overshoots by about 4% once, then settles.
+    private func spring(_ t: Double) -> Double {
+        let damping = 0.72, frequency = 9.5
+        let damped = frequency * (1 - damping * damping).squareRoot()
+        return 1 - exp(-damping * frequency * t) * (cos(damped * t) + damping * frequency / damped * sin(damped * t))
     }
 
     private func tick() {
         let t = min(1, (CACurrentMediaTime() - start) / duration)
-        let eased = 1 - pow(1 - t, 3)
-        for move in moves { place(move, eased) }
-        if t >= 1 { cancel() }
+        let progress = t >= 1 ? 1 : spring(t)
+        for move in moves { place(move, progress) }
+        if t >= 1 {
+            timer?.invalidate()
+            timer = nil
+            moves = []
+            settle()
+        }
     }
 
     private func place(_ move: Move, _ t: Double) {
-        let point = CGPoint(x: move.from.x + (move.to.x - move.from.x) * t,
-                            y: move.from.y + (move.to.y - move.from.y) * t)
-        move.window.element.setPosition(point)
-        move.window.lastSet = CGRect(origin: point, size: move.size)
+        func mix(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
+        let frame = CGRect(x: mix(move.from.minX, move.to.minX), y: mix(move.from.minY, move.to.minY),
+                           width: max(1, mix(move.from.width, move.to.width)), height: max(1, mix(move.from.height, move.to.height)))
+        // Resizing makes an app redraw, so only ask when the size really changed since last time.
+        let last = move.window.lastSet?.size ?? move.from.size
+        let resize = move.window.lastSet == nil || abs(last.width - frame.width) > 0.5 || abs(last.height - frame.height) > 0.5
+        move.window.element.setPosition(frame.origin)
+        if resize { move.window.element.setSize(frame.size) }
+        move.window.lastSet = frame
         onPlace?(move.window)
     }
 }
@@ -148,6 +198,9 @@ final class WindowManager {
     private var mouseMonitor: Any?
     private var notificationTokens: [(NotificationCenter, NSObjectProtocol)] = []
     private var applying = false
+    /// The window whose edge the user is dragging, and when its neighbours were last moved.
+    private var liveID: WindowID?
+    private var lastLiveDraw = 0.0
     /// The window that has keyboard focus, as far as Spool knows. The border follows it.
     private var focusID: WindowID?
     private var pendingSave: DispatchWorkItem?
@@ -161,7 +214,7 @@ final class WindowManager {
     private var lastScrollDraw = 0.0
 
     private let widthPresets = [1.0 / 3, 0.5, 2.0 / 3, 1.0]
-    private let animationDuration = 0.2
+    private let animationDuration = 0.42
 
     // MARK: Lifecycle
 
@@ -204,6 +257,8 @@ final class WindowManager {
             FocusBorder.shared.show(around: frame, width: self.settings.borderWidth)
         }
 
+        animator.onResized = { [weak self] windows in self?.checkMinimumWidths(windows) }
+
         reconcile(initial: true)
     }
 
@@ -225,6 +280,7 @@ final class WindowManager {
         focusID = nil
         marks = [:]
         peekState = nil
+        liveID = nil
         for window in windows.values where window.lastSet != nil {
             window.element.setSize(window.originalFrame.size)
             window.element.setPosition(window.originalFrame.origin)
@@ -267,7 +323,10 @@ final class WindowManager {
             // Spool's own moves arrive here too; only a held mouse button means the user did it.
             guard let id = element.windowID else { return }
             let held = NSEvent.pressedMouseButtons & 1 != 0
-            if held { dragged.insert(id) }
+            if held {
+                dragged.insert(id)
+                if notification == kAXWindowResizedNotification { liveResize(id) }
+            }
             if id == focusID, held || windows[id]?.stripKey == nil { updateBorder(live: true) }
         default:
             break
@@ -507,52 +566,51 @@ final class WindowManager {
         }
     }
 
-    private func apply(animated: Bool, positionsOnly: Bool = false) {
+    private func apply(animated: Bool, positionsOnly: Bool = false, skipping: WindowID? = nil) {
         var moves: [Animator.Move] = []
-        var grew = false
         let screens = currentScreens()
         for screen in screens {
             guard let strip = strips[screen.key] else { continue }
             let others = screens.filter { $0.key != screen.key }.map(\.full)
             let frames = strip.frames(in: screen.area, outer: settings.outerGap, metrics(strip, screen))
-            for (id, raw) in frames {
+            for (id, raw) in frames where id != skipping {
                 guard let window = windows[id] else { continue }
                 let parked = park(raw, in: screen.full, avoiding: others)
-                let target = parked.frame
                 // A window going to or from a hiding place far from its edge must not be seen crossing the screen.
                 let jump = parked.relocated || window.relocated
                 window.relocated = parked.relocated
-                let current = window.lastSet ?? window.element.frame ?? target
-                var size = current.size
-                if !positionsOnly {
-                    size = target.size
-                    if window.lastSet == nil || abs(current.width - target.width) > 0.5 || abs(current.height - target.height) > 0.5 {
-                        window.element.setSize(target.size)
-                        // Some apps refuse to go this narrow; give the column the width they settled on.
-                        if let actual = window.element.size, actual.width > target.width + 2, Double(actual.width) > window.minWidth {
-                            window.minWidth = Double(actual.width)
-                            grew = true
-                        }
-                    }
-                }
-                if window.lastSet != nil, abs(current.minX - target.minX) < 0.5, abs(current.minY - target.minY) < 0.5 {
-                    window.lastSet = CGRect(origin: target.origin, size: size)
+                let current = window.lastSet ?? window.element.frame ?? parked.frame
+                var target = parked.frame
+                if positionsOnly { target.size = current.size }
+                if window.lastSet != nil, abs(current.minX - target.minX) < 0.5, abs(current.minY - target.minY) < 0.5,
+                   abs(current.width - target.width) < 0.5, abs(current.height - target.height) < 0.5 {
                     continue
                 }
                 // Windows that stay off screen jump; nobody sees them travel.
                 let seen = current.intersects(screen.full.insetBy(dx: 2, dy: 0)) || target.intersects(screen.full.insetBy(dx: 2, dy: 0))
-                moves.append(.init(window: window, from: current.origin, to: target.origin, size: size, animate: animated && seen && !jump))
+                moves.append(.init(window: window, from: current, to: target, animate: animated && seen && !jump))
             }
         }
         animator.run(moves, duration: settings.animations ? animationDuration : 0)
         updateBorder()
         if !positionsOnly { scheduleSave() }
-        if grew && !applying {
-            applying = true
-            ensureAllVisible()
-            apply(animated: false)
-            applying = false
+    }
+
+    /// Some apps refuse to go as narrow as asked. Give their column the width they settled on.
+    private func checkMinimumWidths(_ resized: [ManagedWindow]) {
+        guard running, !applying, liveID == nil else { return }
+        var grew = false
+        for window in resized {
+            guard let asked = window.lastSet, let actual = window.element.size,
+                  actual.width > asked.width + 2, Double(actual.width) > window.minWidth else { continue }
+            window.minWidth = Double(actual.width)
+            grew = true
         }
+        guard grew else { return }
+        applying = true
+        ensureAllVisible()
+        apply(animated: false)
+        applying = false
     }
 
     // MARK: Actions
@@ -685,10 +743,19 @@ final class WindowManager {
     /// After the user lets go of a window: adopt a new size, or reorder to where it was dropped.
     private func finishDrag() {
         guard running, !dragged.isEmpty else { return }
-        let ids = dragged
+        var ids = dragged
         dragged = []
         let screens = currentScreens()
         var changed = false
+        if let live = liveID {
+            // The neighbours have been following the edge; take the final size and let everything settle.
+            liveID = nil
+            adoptResize(live)
+            if let key = windows[live]?.stripKey { strips[key]?.overscroll = false }
+            // Windows Spool moved to keep up are in the set too; none of them was dragged.
+            ids = []
+            changed = true
+        }
         for id in ids {
             guard let window = windows[id], let key = window.stripKey, var strip = strips[key],
                   let screen = screens.first(where: { $0.key == key }),
@@ -724,6 +791,48 @@ final class WindowManager {
         dropEmptyStrips()
         ensureAllVisible()
         apply(animated: true)
+    }
+
+    /// Called as the user drags a window's edge: the rest of the strip follows straight away.
+    private func liveResize(_ id: WindowID) {
+        if liveID == nil {
+            // Resize notifications also come from Spool's own animation. Finish it first, so
+            // the next one can only be the user's.
+            if animator.isRunning {
+                animator.finish()
+                return
+            }
+            guard windows[id]?.stripKey != nil else { return }
+            liveID = id
+        }
+        guard liveID == id else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastLiveDraw > 0.012 else { return }
+        lastLiveDraw = now
+        adoptResize(id)
+        apply(animated: false, skipping: id)
+    }
+
+    /// Makes the strip agree with the size and position the user has given a window.
+    private func adoptResize(_ id: WindowID) {
+        guard let window = windows[id], let key = window.stripKey, var strip = strips[key],
+              let screen = currentScreens().first(where: { $0.key == key }),
+              let frame = window.element.frame, let place = strip.locate(id) else { return }
+        window.minWidth = 0
+        strip.setWidth(of: id, .points(Double(frame.width)))
+        let column = strip.columns[place.column]
+        if column.windows.count > 1, !column.tabbed, abs(frame.height - (window.lastSet?.height ?? frame.height)) > 1 {
+            let available = Double(screen.area.height) - 2 * settings.outerGap
+            strip.setHeight(of: id, fraction: Double(frame.height) / available)
+        }
+        // Dragging the left edge moves the window itself, so scroll the strip to keep the
+        // column where the user has put it instead of pulling it back.
+        if let laid = strip.frames(in: screen.area, outer: settings.outerGap, metrics(strip, screen))[id] {
+            strip.offset += Double(laid.minX - frame.minX)
+            strip.overscroll = true
+        }
+        strips[key] = strip
+        window.lastSet = frame
     }
 
     // MARK: Shared helpers for the features below
@@ -947,7 +1056,7 @@ final class WindowManager {
     @discardableResult
     func beginScroll() -> Bool {
         guard running, let screen = screenUnderMouse(in: currentScreens()), let strip = strips[screen.key] else { return false }
-        animator.cancel()
+        animator.finish()
         scrollKey = screen.key
         scrollStart = strip.offset
         return true
