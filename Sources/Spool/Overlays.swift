@@ -18,36 +18,58 @@ func appKitRect(_ rect: CGRect) -> CGRect {
     return CGRect(x: rect.minX, y: height - rect.maxY, width: rect.width, height: rect.height)
 }
 
+/// A coloured edge around the focused window.
+///
+/// It is not drawn on top. A shape slightly larger than the window is slid directly beneath
+/// it in the window stack, so the window's own outline is the inner edge of the border and
+/// the two meet exactly, whatever the window's corners look like.
 final class FocusBorder {
     static let shared = FocusBorder()
 
     private let window = overlayWindow()
     private let shape = CAShapeLayer()
-    /// Close to the corner radius of a standard macOS window.
-    private let radius: CGFloat = 12
 
     private init() {
+        window.level = .normal
+        // Transient keeps it out of Mission Control.
+        window.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
         let view = NSView()
         view.wantsLayer = true
-        shape.fillColor = nil
+        shape.fillRule = .evenOdd
         view.layer?.addSublayer(shape)
         window.contentView = view
     }
 
-    /// `frame` is the focused window's frame in accessibility coordinates.
-    func show(around frame: CGRect, width: CGFloat) {
-        // The stroke sits just outside the window so it never covers its content.
+    /// `frame` is the window's frame in accessibility coordinates, `id` its window number and
+    /// `radius` its corner radius, which only shapes the outer edge.
+    func show(around frame: CGRect, below id: UInt32, width: CGFloat, radius: CGFloat) {
         let outer = appKitRect(frame).insetBy(dx: -width, dy: -width)
         window.setFrame(outer, display: false)
+        let bounds = CGRect(origin: .zero, size: outer.size)
+        let ring = CGMutablePath()
+        ring.addRoundedRect(in: bounds, cornerWidth: radius + width, cornerHeight: radius + width)
+        // Hollow, so a see-through window is not tinted. The hole stays hidden under the
+        // window: it starts a little inside the edge and is rounder than any real corner.
+        let hole = bounds.insetBy(dx: width + 2, dy: width + 2)
+        let holeRadius = min(radius + 12, hole.width / 2, hole.height / 2)
+        if hole.width > 0, hole.height > 0 {
+            ring.addRoundedRect(in: hole, cornerWidth: holeRadius, cornerHeight: holeRadius)
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)   // no implicit animation; it must stay glued to the window
-        shape.frame = CGRect(origin: .zero, size: outer.size)
-        shape.lineWidth = width
-        shape.strokeColor = NSColor.controlAccentColor.cgColor
-        let inset = shape.frame.insetBy(dx: width / 2, dy: width / 2)
-        shape.path = CGPath(roundedRect: inset, cornerWidth: radius + width / 2, cornerHeight: radius + width / 2, transform: nil)
+        shape.frame = bounds
+        shape.fillColor = NSColor.controlAccentColor.cgColor
+        shape.path = ring
         CATransaction.commit()
-        if !window.isVisible { window.orderFrontRegardless() }
+        if !window.isVisible {
+            window.alphaValue = 0
+            window.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                window.animator().alphaValue = 1
+            }
+        }
+        window.order(.below, relativeTo: Int(id))
     }
 
     func hide() {

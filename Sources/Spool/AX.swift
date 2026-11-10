@@ -33,6 +33,10 @@ extension AXUIElement {
     /// nil when the app did not answer, which is different from having no windows.
     var windows: [AXUIElement]? { raw(kAXWindowsAttribute) as? [AXUIElement] }
     var focusedWindow: AXUIElement? { element(kAXFocusedWindowAttribute) }
+    var hasToolbar: Bool {
+        (raw(kAXChildrenAttribute) as? [AXUIElement])?.contains { ($0.raw(kAXRoleAttribute) as? String) == kAXToolbarRole } ?? false
+    }
+
     var title: String? { raw(kAXTitleAttribute) as? String }
     var subrole: String? { raw(kAXSubroleAttribute) as? String }
     var isMinimized: Bool { bool(kAXMinimizedAttribute) }
@@ -70,6 +74,14 @@ extension AXUIElement {
         guard let value = AXValueCreate(.cgSize, &size) else { return }
         AXUIElementSetAttributeValue(self, kAXSizeAttribute as CFString, value)
     }
+}
+
+/// Where the window server has a window right now, in accessibility coordinates. Unlike the
+/// accessibility API this does not wait on the app, and it is the size the app really took.
+func windowServerBounds(_ id: WindowID) -> CGRect? {
+    guard let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], id) as? [[String: Any]],
+          let bounds = list.first?[kCGWindowBounds as String] as? NSDictionary else { return nil }
+    return CGRect(dictionaryRepresentation: bounds)
 }
 
 /// Window server IDs of normal-layer windows.

@@ -167,7 +167,7 @@ struct Settings: Codable, Equatable {
     /// Recorded bindings, keyed by `Action.rawValue`, that replace the style's defaults.
     var overrides: [String: KeyCombo] = [:]
     var focusBorder = true
-    var borderWidth = 3.0
+    var borderWidth = 2.0
     var widthOverlay = true
     var restoreSession = true
     var minimap = true

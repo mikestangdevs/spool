@@ -20,6 +20,12 @@ final class ManagedWindow {
     let bundleID: String?
     /// Hidden somewhere other than the edge it scrolled off, because another display is there.
     var relocated = false
+    /// From macOS 26 a window with a toolbar has rounder corners than one with only a title
+    /// bar. The system does not report the radius, so this is read off the window's make-up.
+    lazy var cornerRadius: CGFloat = {
+        guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 else { return 10 }
+        return element.hasToolbar ? 26 : 16
+    }()
     /// Times this window was held back from the strip while a possible tab switch settled.
     var deferrals = 0
 
@@ -82,6 +88,8 @@ private final class Animator {
 
     /// Called each time a window is placed, so overlays can follow it.
     var onPlace: ((ManagedWindow) -> Void)?
+    /// Called when nothing is moving any more.
+    var onIdle: (() -> Void)?
     /// Called with the windows whose size was changed, once they have reached it.
     var onResized: (([ManagedWindow]) -> Void)?
 
@@ -141,6 +149,7 @@ private final class Animator {
         let done = resized
         resized = []
         if !done.isEmpty { onResized?(done) }
+        onIdle?()
     }
 
     private func distance(_ move: Move) -> CGFloat {
@@ -255,11 +264,14 @@ final class WindowManager {
         safetyTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.reconcile() }
 
         animator.onPlace = { [weak self] window in
-            guard let self, window.id == self.focusID, self.settings.focusBorder, let frame = window.lastSet else { return }
-            FocusBorder.shared.show(around: frame, width: self.settings.borderWidth)
+            // The border is a separate window and cannot keep step with one that is moving,
+            // so it steps aside and comes back when the window has landed.
+            guard let self, window.id == self.focusID else { return }
+            FocusBorder.shared.hide()
         }
 
         animator.onResized = { [weak self] windows in self?.checkMinimumWidths(windows) }
+        animator.onIdle = { [weak self] in self?.updateBorder() }
 
         reconcile(initial: true)
     }
@@ -326,7 +338,10 @@ final class WindowManager {
                 dragged.insert(id)
                 if notification == kAXWindowResizedNotification { liveResize(id) }
             }
-            if id == focusID, held || windows[id]?.stripKey == nil { updateBorder(live: true) }
+            // Apps often settle on a slightly different size a moment after being asked.
+            if id == focusID {
+                if held { FocusBorder.shared.hide() } else { updateBorder() }
+            }
         default:
             break
         }
@@ -568,15 +583,15 @@ final class WindowManager {
         }
     }
 
-    /// Draws the border around the focused window, or hides it when there is none to draw.
-    /// `live` reads the frame from the app, for a window the user is dragging.
-    private func updateBorder(live: Bool = false) {
-        guard running, settings.focusBorder, let id = focusID, let window = windows[id],
-              let frame = (live || window.stripKey == nil ? nil : window.lastSet) ?? window.element.frame else {
+    /// Fits the border to the focused window as it really is on screen, or hides it.
+    private func updateBorder() {
+        guard running, settings.focusBorder, !animator.isRunning, scrollKey == nil, liveID == nil,
+              let id = focusID, let window = windows[id],
+              let frame = windowServerBounds(id) ?? window.lastSet ?? window.element.frame else {
             FocusBorder.shared.hide()
             return
         }
-        FocusBorder.shared.show(around: frame, width: settings.borderWidth)
+        FocusBorder.shared.show(around: frame, below: id, width: settings.borderWidth, radius: window.cornerRadius)
     }
 
     private func focus(_ window: ManagedWindow) {
@@ -788,6 +803,7 @@ final class WindowManager {
     /// After the user lets go of a window: adopt a new size, or reorder to where it was dropped.
     private func finishDrag() {
         guard running, !dragged.isEmpty else { return }
+        defer { updateBorder() }
         var ids = dragged
         dragged = []
         let screens = currentScreens()
