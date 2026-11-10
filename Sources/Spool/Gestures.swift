@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import QuartzCore
 
 // MARK: Trackpad swipe
 
@@ -42,16 +43,51 @@ final class SwipeRecognizer {
         case rejected
     }
 
+    private typealias Stop = @convention(c) (UnsafeRawPointer) -> Int32
+
     private var devices: CFArray?
     private var phase = Phase.idle
+    private var lastFrame = 0.0
+    private var observing = false
     /// Strip points travelled per full trackpad width, as a multiple of the screen width.
     private let gain = 1.6
 
     private(set) var available = false
 
+    private let lib = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_LAZY)
+
     func start() {
+        connect()
+        guard !observing else { return }
+        observing = true
+        // The trackpad connection does not survive sleep, and trackpads come and go with docks.
+        let reconnect: (Notification) -> Void = { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self?.restart() }
+        }
+        let workspace = NSWorkspace.shared.notificationCenter
+        workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main, using: reconnect)
+        workspace.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main, using: reconnect)
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main, using: reconnect)
+    }
+
+    private func restart() {
+        if case .sliding = phase { WindowManager.shared.endScroll() }
+        phase = .idle
+        if let devices, let stop = dlsym(lib, "MTDeviceStop"), let unregister = dlsym(lib, "MTUnregisterContactFrameCallback") {
+            for i in 0..<CFArrayGetCount(devices) {
+                guard let device = CFArrayGetValueAtIndex(devices, i) else { continue }
+                unsafeBitCast(unregister, to: Register.self)(device, touchFrame)
+                _ = unsafeBitCast(stop, to: Stop.self)(device)
+            }
+        }
+        devices = nil
+        available = false
+        connect()
+    }
+
+    private func connect() {
         guard devices == nil,
-              let lib = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_LAZY),
               let create = dlsym(lib, "MTDeviceCreateList"),
               let register = dlsym(lib, "MTRegisterContactFrameCallback"),
               let start = dlsym(lib, "MTDeviceStart"),
@@ -66,6 +102,15 @@ final class SwipeRecognizer {
     }
 
     fileprivate func frame(fingers: Int, x: Double, y: Double) {
+        // Frames stop arriving when the fingers lift. A long gap means the last gesture never
+        // reported its end, so start clean rather than stay stuck in it.
+        let now = CACurrentMediaTime()
+        if now - lastFrame > 0.5 {
+            if case .sliding = phase { WindowManager.shared.endScroll() }
+            phase = .idle
+        }
+        lastFrame = now
+
         let wanted = SettingsStore.shared.value.swipeFingers
         guard wanted > 0 else {
             if case .sliding = phase { WindowManager.shared.endScroll() }
