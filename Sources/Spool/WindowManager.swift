@@ -20,6 +20,8 @@ final class ManagedWindow {
     let bundleID: String?
     /// Hidden somewhere other than the edge it scrolled off, because another display is there.
     var relocated = false
+    /// Times this window was held back from the strip while a possible tab switch settled.
+    var deferrals = 0
 
     init(id: WindowID, element: AXUIElement, pid: pid_t, bundleID: String?, frame: CGRect) {
         self.id = id
@@ -309,12 +311,9 @@ final class WindowManager {
             scheduleReconcile()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.reconcile() }
         case kAXUIElementDestroyedNotification:
-            guard let window = windows.values.first(where: { CFEqual($0.element, element) }) else { return }
-            detach(window)
-            windows[window.id] = nil
-            dropEmptyStrips()
-            ensureAllVisible()
-            apply(animated: true)
+            // Not removed here: closing a tab is followed by its neighbour appearing in the
+            // same place, and reconcile needs to see both to keep the column.
+            scheduleReconcile()
         case kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification:
             scheduleReconcile()
         case kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification:
@@ -372,7 +371,8 @@ final class WindowManager {
                 let hidden = !showing.contains(id) || element.isMinimized || element.isFullscreen
                 if let key = window.stripKey {
                     if currentKeys.contains(key) {
-                        if hidden {
+                        // A window that has merely stopped showing is dealt with below.
+                        if element.isMinimized || element.isFullscreen {
                             detach(window)
                             changed = true
                         }
@@ -386,6 +386,51 @@ final class WindowManager {
                 }
             }
         }
+
+        // Every tab of a tabbed window is a window of its own, and only the front tab is on
+        // screen. Opening, switching or closing a tab therefore looks like one window vanishing
+        // and another appearing in the same place. Treat that pair as one window: the newcomer
+        // takes over the column instead of leaving a gap and opening a new one.
+        var departed = windows.values.filter { window in
+            window.stripKey.map(currentKeys.contains) == true && !showing.contains(window.id)
+        }
+        func sameSpot(_ a: CGRect, _ b: CGRect) -> Bool {
+            // Loose on size: apps such as Terminal settle a little short of the size they were given.
+            abs(a.minX - b.minX) < 6 && abs(a.minY - b.minY) < 6 && abs(a.width - b.width) < 30 && abs(a.height - b.height) < 30
+        }
+        var retry = false
+        arrivals.removeAll { arrival in
+            let new = arrival.window
+            if let i = departed.firstIndex(where: { $0.pid == new.pid && $0.lastSet.map { sameSpot($0, arrival.frame) } == true }),
+               let key = departed[i].stripKey, strips[key]?.replace(departed[i].id, with: new.id) == true {
+                let old = departed.remove(at: i)
+                new.stripKey = key
+                new.lastSet = old.lastSet
+                new.minWidth = old.minWidth
+                new.relocated = old.relocated
+                old.stripKey = nil
+                old.lastSet = nil
+                changed = true
+                return true
+            }
+            // The old tab can still be on screen for a moment after the new one appears.
+            // Hold the newcomer back briefly rather than give it a column it should not have.
+            let twin = windows.values.contains { other in
+                other.id != new.id && other.pid == new.pid && other.stripKey != nil && showing.contains(other.id)
+                    && other.lastSet.map { sameSpot($0, arrival.frame) } == true
+            }
+            if twin && !initial && new.deferrals < 3 {
+                new.deferrals += 1
+                retry = true
+                return true
+            }
+            return false
+        }
+        for window in departed {
+            detach(window)
+            changed = true
+        }
+        if retry { scheduleReconcile(after: 0.12) }
 
         // Windows on other Spaces are missing from the accessibility list, so only the
         // window server can say that one has really closed.

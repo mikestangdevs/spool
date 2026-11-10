@@ -102,6 +102,14 @@ public struct Strip: Equatable, Codable {
         columns[focused].active = columns[focused].windows.count - 1
     }
 
+    /// Puts `new` exactly where `old` was: same column, row, width and height.
+    @discardableResult
+    public mutating func replace(_ old: WindowID, with new: WindowID) -> Bool {
+        guard let (c, r) = locate(old), locate(new) == nil else { return false }
+        columns[c].windows[r] = new
+        return true
+    }
+
     // MARK: Focus
 
     @discardableResult

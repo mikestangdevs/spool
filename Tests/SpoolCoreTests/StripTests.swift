@@ -315,4 +315,17 @@ final class StripTests: XCTestCase {
         XCTAssertNil(Command.parse(["save"]))
         XCTAssertEqual(Command.url(for: ["save", "deep work"]).flatMap(Command.parse), .saveStrip("deep work"))
     }
+
+    func testReplaceKeepsThePlace() {
+        var s = strip([1, 2, 3])
+        s.focus(2)
+        s.stackLeft()
+        s.setWidth(of: 2, .points(700))
+        XCTAssertTrue(s.replace(2, with: 9))
+        XCTAssertEqual(s.columns.map(\.windows), [[1, 9], [3]])
+        XCTAssertEqual(s.columns[0].width, .points(700))
+        XCTAssertEqual(s.focusedWindow, 9)
+        XCTAssertFalse(s.replace(2, with: 8))   // already gone
+        XCTAssertFalse(s.replace(9, with: 3))   // never two of the same window
+    }
 }
