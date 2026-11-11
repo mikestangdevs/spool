@@ -151,20 +151,20 @@ final class Minimap {
         override func draw(_ dirtyRect: NSRect) {
             NSColor.black.withAlphaComponent(0.55).setFill()
             NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
-            let inner = bounds.insetBy(dx: 10, dy: 6)
+            let inner = bounds.insetBy(dx: 7, dy: 4.5)
             // The view can be scrolled a little past either end, so the map covers that too.
             let low = min(0, offset), high = max(total, offset + usable)
             let scale = inner.width / (high - low)
             let x = { (value: Double) in inner.minX + (value - low) * scale }
             for i in origins.indices {
-                let tick = NSRect(x: x(origins[i]), y: inner.minY, width: max(2, widths[i] * scale - 1.5), height: inner.height)
+                let tick = NSRect(x: x(origins[i]), y: inner.minY, width: max(1.5, widths[i] * scale - 1), height: inner.height)
                 (i == focused ? NSColor.controlAccentColor : NSColor.white.withAlphaComponent(0.45)).setFill()
-                NSBezierPath(roundedRect: tick, xRadius: 2, yRadius: 2).fill()
+                NSBezierPath(roundedRect: tick, xRadius: 1.5, yRadius: 1.5).fill()
             }
-            let view = NSRect(x: x(offset), y: inner.minY - 3, width: usable * scale, height: inner.height + 6)
+            let view = NSRect(x: x(offset), y: inner.minY - 2, width: usable * scale, height: inner.height + 4)
             NSColor.white.setStroke()
-            let outline = NSBezierPath(roundedRect: view, xRadius: 4, yRadius: 4)
-            outline.lineWidth = 1.5
+            let outline = NSBezierPath(roundedRect: view, xRadius: 3, yRadius: 3)
+            outline.lineWidth = 1
             outline.stroke()
         }
     }
@@ -187,8 +187,8 @@ final class Minimap {
         view.usable = usable
         view.focused = focused
         let screen = appKitRect(area)
-        let size = CGSize(width: min(360, screen.width * 0.3), height: 26)
-        window.setFrame(CGRect(x: screen.midX - size.width / 2, y: screen.minY + 22, width: size.width, height: size.height), display: false)
+        let size = CGSize(width: min(200, screen.width * 0.16), height: 16)
+        window.setFrame(CGRect(x: screen.midX - size.width / 2, y: screen.minY + 16, width: size.width, height: size.height), display: false)
         view.needsDisplay = true
         window.alphaValue = 1
         if !window.isVisible { window.orderFrontRegardless() }
