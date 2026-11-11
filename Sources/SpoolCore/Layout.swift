@@ -2,17 +2,34 @@ import CoreGraphics
 import Foundation
 
 public struct Metrics {
+    /// A window that came up slightly short of the width it was asked for.
+    public struct Fit: Equatable {
+        public var asked: Double
+        public var got: Double
+        public init(asked: Double, got: Double) {
+            self.asked = asked
+            self.got = got
+        }
+    }
+
     /// Width available to columns, after the outer gaps.
     public var usable: Double
     /// Gap between neighbouring columns and between stacked windows.
     public var gap: Double
     /// Widths that apps refused to go below, measured after a resize.
     public var minWidths: [WindowID: Double]
+    /// Widths that apps refused to go above. System Settings, for one, has a fixed width.
+    public var maxWidths: [WindowID: Double]
+    /// Apps such as Terminal only resize in steps and stop just short of some widths.
+    public var fits: [WindowID: Fit]
 
-    public init(usable: Double, gap: Double, minWidths: [WindowID: Double] = [:]) {
+    public init(usable: Double, gap: Double, minWidths: [WindowID: Double] = [:],
+                maxWidths: [WindowID: Double] = [:], fits: [WindowID: Fit] = [:]) {
         self.usable = usable
         self.gap = gap
         self.minWidths = minWidths
+        self.maxWidths = maxWidths
+        self.fits = fits
     }
 }
 
@@ -20,7 +37,7 @@ public let minimumColumnWidth: Double = 120
 
 extension ColumnWidth {
     /// Fractions are sized so that, say, two halves and the gap between them fill the screen exactly.
-    func resolve(_ m: Metrics) -> Double {
+    public func resolve(_ m: Metrics) -> Double {
         switch self {
         case .fraction(let f): return max(minimumColumnWidth, (m.usable + m.gap) * f - m.gap)
         case .points(let p): return min(max(p, minimumColumnWidth), m.usable)
@@ -31,7 +48,15 @@ extension ColumnWidth {
 public extension Strip {
     func widths(_ m: Metrics) -> [Double] {
         columns.map { column in
-            max(column.width.resolve(m), column.windows.compactMap { m.minWidths[$0] }.max() ?? 0)
+            let wanted = column.width.resolve(m)
+            // A column is as wide as its widest window can actually be, so that no window
+            // leaves a strip of empty column beside it.
+            let reachable = column.windows.map { id -> Double in
+                var width = wanted
+                if let fit = m.fits[id], abs(fit.asked - wanted) < 0.5 { width = fit.got }
+                return min(width, m.maxWidths[id] ?? .infinity)
+            }
+            return max(reachable.max() ?? wanted, column.windows.compactMap { m.minWidths[$0] }.max() ?? 0)
         }
     }
 

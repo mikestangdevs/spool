@@ -328,4 +328,32 @@ final class StripTests: XCTestCase {
         XCTAssertFalse(s.replace(2, with: 8))   // already gone
         XCTAssertFalse(s.replace(9, with: 3))   // never two of the same window
     }
+
+    func testColumnShrinksToAWindowThatWillNotGrow() {
+        let s = strip([1, 2])   // halves: 495 each
+        let fixed = Metrics(usable: 1000, gap: 10, maxWidths: [1: 360])
+        XCTAssertEqual(s.widths(fixed)[0], 360)
+        XCTAssertEqual(s.origins(fixed)[1], 370)   // the neighbour closes up, no gap
+        XCTAssertEqual(s.widths(fixed)[1], 495)
+    }
+
+    func testColumnTakesTheWidthAnAppSettledOn() {
+        var s = strip([1, 2])
+        let snapped = Metrics(usable: 1000, gap: 10, fits: [1: .init(asked: 495, got: 491)])
+        XCTAssertEqual(s.widths(snapped)[0], 491)
+        XCTAssertEqual(s.origins(snapped)[1], 501)
+        // The measurement belongs to that one width; at another the app is asked afresh.
+        s.setWidth(of: 1, .fraction(1))
+        XCTAssertEqual(s.widths(snapped)[0], 1000)
+    }
+
+    func testStackIsAsWideAsItsWidestWindow() {
+        var s = strip([1, 2, 3])
+        s.focus(2)
+        s.stackLeft()   // column 0 holds 1 and 2
+        let mixed = Metrics(usable: 1000, gap: 10, maxWidths: [1: 360])
+        XCTAssertEqual(s.widths(mixed)[0], 495)   // window 2 can still fill the column
+        let both = Metrics(usable: 1000, gap: 10, maxWidths: [1: 360, 2: 420])
+        XCTAssertEqual(s.widths(both)[0], 420)
+    }
 }

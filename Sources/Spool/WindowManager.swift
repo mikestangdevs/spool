@@ -17,6 +17,10 @@ final class ManagedWindow {
     var lastSet: CGRect?
     /// Width the app fell back to when asked to go narrower.
     var minWidth = 0.0
+    /// Width the app would not go beyond when asked to go wider.
+    var maxWidth = Double.infinity
+    /// The last time the app stopped just short of the width asked for.
+    var fit: Metrics.Fit?
     let bundleID: String?
     /// Hidden somewhere other than the edge it scrolled off, because another display is there.
     var relocated = false
@@ -226,6 +230,9 @@ final class WindowManager {
 
     private let widthPresets = [1.0 / 3, 0.5, 2.0 / 3, 1.0]
     private let animationDuration = 0.42
+    /// An app that stops more than this far short of a width has hit a real limit. Less than
+    /// this is step rounding: Terminal sizes in whole characters, about 8 points wide.
+    private let maxWidthShortfall = 24.0
 
     // MARK: Lifecycle
 
@@ -250,6 +257,12 @@ final class WindowManager {
                 }
                 self?.scheduleReconcile()
             }))
+        notificationTokens.append((workspace, workspace.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
+                if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                    self?.watchLaunch(app.processIdentifier)
+                }
+            }))
         let center = NotificationCenter.default
         notificationTokens.append((center, center.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
@@ -270,7 +283,7 @@ final class WindowManager {
             FocusBorder.shared.hide()
         }
 
-        animator.onResized = { [weak self] windows in self?.checkMinimumWidths(windows) }
+        animator.onResized = { [weak self] windows in self?.checkWidths(windows) }
         animator.onIdle = { [weak self] in self?.updateBorder() }
 
         reconcile(initial: true)
@@ -344,6 +357,25 @@ final class WindowManager {
             }
         default:
             break
+        }
+    }
+
+    /// A launching app cannot be observed until it is ready, and has no window until a little
+    /// after that. Keep trying for a few seconds so its first window joins the strip as
+    /// promptly as a new window of a running app does.
+    private func watchLaunch(_ pid: pid_t, attempt: Int = 0) {
+        guard running, attempt < 60, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
+        if app.activationPolicy == .regular {
+            if observers[pid] == nil {
+                observers[pid] = AppObserver(pid: pid, refcon: Unmanaged.passUnretained(self).toOpaque())
+            }
+            if let observer = observers[pid], observer.element.windows?.isEmpty == false {
+                reconcile()
+                if windows.values.contains(where: { $0.pid == pid }) { return }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+            self?.watchLaunch(pid, attempt: attempt + 1)
         }
     }
 
@@ -422,6 +454,8 @@ final class WindowManager {
                 new.stripKey = key
                 new.lastSet = old.lastSet
                 new.minWidth = old.minWidth
+                new.maxWidth = old.maxWidth
+                new.fit = old.fit
                 new.relocated = old.relocated
                 old.stripKey = nil
                 old.lastSet = nil
@@ -467,6 +501,7 @@ final class WindowManager {
             var strip = strips[screen.key] ?? Strip()
             let rule = settings.rule(for: window.bundleID)
             let width = (rule?.width ?? settings.newWindowWidth).width(current: Double(frame.width))
+            probeWidth(window, width, on: screen, current: frame)
             if rule?.stacks == true, !initial {
                 strip.addToFocusedColumn(window.id, width: width)
             } else {
@@ -607,11 +642,14 @@ final class WindowManager {
     // MARK: Layout
 
     private func metrics(_ strip: Strip, _ screen: ScreenInfo) -> Metrics {
-        var minWidths: [WindowID: Double] = [:]
+        var m = Metrics(usable: Double(screen.area.width) - 2 * settings.outerGap, gap: settings.innerGap)
         for id in strip.allWindows {
-            if let min = windows[id]?.minWidth, min > 0 { minWidths[id] = min }
+            guard let window = windows[id] else { continue }
+            if window.minWidth > 0 { m.minWidths[id] = window.minWidth }
+            if window.maxWidth.isFinite { m.maxWidths[id] = window.maxWidth }
+            if let fit = window.fit { m.fits[id] = fit }
         }
-        return Metrics(usable: Double(screen.area.width) - 2 * settings.outerGap, gap: settings.innerGap, minWidths: minWidths)
+        return m
     }
 
     private func ensureVisible(_ key: String) {
@@ -656,21 +694,52 @@ final class WindowManager {
         if !positionsOnly { scheduleSave() }
     }
 
-    /// Some apps refuse to go as narrow as asked. Give their column the width they settled on.
-    private func checkMinimumWidths(_ resized: [ManagedWindow]) {
+    /// A width is a request. Compares what each app actually took with what it was asked
+    /// for, and lays the strip out again around the real widths so no gaps are left.
+    private func checkWidths(_ resized: [ManagedWindow]) {
         guard running, !applying, liveID == nil else { return }
-        var grew = false
+        var changed = false
         for window in resized {
-            guard let asked = window.lastSet, let actual = window.element.size,
-                  actual.width > asked.width + 2, Double(actual.width) > window.minWidth else { continue }
-            window.minWidth = Double(actual.width)
-            grew = true
+            guard window.stripKey != nil, let asked = window.lastSet, let actual = window.element.size else { continue }
+            changed = learnWidth(window, asked: Double(asked.width), got: Double(actual.width)) || changed
         }
-        guard grew else { return }
+        guard changed else { return }
         applying = true
         ensureAllVisible()
         apply(animated: false)
         applying = false
+    }
+
+    /// Records how an app answered a width request. Returns true if the layout should change.
+    private func learnWidth(_ window: ManagedWindow, asked: Double, got: Double) -> Bool {
+        if got > asked + 2 {
+            guard got > window.minWidth else { return false }
+            window.minWidth = got
+        } else if got < asked - maxWidthShortfall {
+            guard got < window.maxWidth else { return false }
+            window.maxWidth = got
+        } else if got < asked - 1.5 {
+            let fit = Metrics.Fit(asked: asked, got: got)
+            guard window.fit != fit else { return false }
+            window.fit = fit
+        } else {
+            return false
+        }
+        return true
+    }
+
+    /// Asks a newly arrived window for the width it is about to be given, to find out before
+    /// the first layout whether it will take it. Otherwise the strip opens with a gap and
+    /// closes it a moment later.
+    private func probeWidth(_ window: ManagedWindow, _ width: ColumnWidth, on screen: ScreenInfo, current: CGRect) {
+        guard case .fraction = width else { return }
+        let m = Metrics(usable: Double(screen.area.width) - 2 * settings.outerGap, gap: settings.innerGap)
+        let asked = width.resolve(m)
+        guard abs(asked - Double(current.width)) > 2 else { return }
+        window.element.setSize(CGSize(width: asked, height: current.height))
+        guard let got = window.element.size else { return }
+        _ = learnWidth(window, asked: asked, got: Double(got.width))
+        window.lastSet = nil   // it has been resized behind the layout's back; read it afresh
     }
 
     // MARK: Actions
@@ -825,6 +894,8 @@ final class WindowManager {
             if dw > 3 || dh > 3 {
                 if dw > 3 {
                     window.minWidth = 0
+                    window.maxWidth = .infinity
+                    window.fit = nil
                     strip.setWidth(of: id, .points(Double(frame.width)))
                 }
                 if dh > 3 {
@@ -880,6 +951,8 @@ final class WindowManager {
               let screen = currentScreens().first(where: { $0.key == key }),
               let frame = window.element.frame, let place = strip.locate(id) else { return }
         window.minWidth = 0
+        window.maxWidth = .infinity
+        window.fit = nil
         strip.setWidth(of: id, .points(Double(frame.width)))
         let column = strip.columns[place.column]
         if column.windows.count > 1, !column.tabbed, abs(frame.height - (window.lastSet?.height ?? frame.height)) > 1 {
