@@ -28,7 +28,7 @@ final class ManagedWindow {
     /// bar. The system does not report the radius, so this is read off the window's make-up.
     lazy var cornerRadius: CGFloat = {
         guard ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26 else { return 10 }
-        return element.hasToolbar ? 26 : 16
+        return element.hasToolbar ? 26 : 13
     }()
     /// Times this window was held back from the strip while a possible tab switch settled.
     var deferrals = 0
@@ -36,6 +36,7 @@ final class ManagedWindow {
     init(id: WindowID, element: AXUIElement, pid: pid_t, bundleID: String?, frame: CGRect) {
         self.id = id
         self.bundleID = bundleID
+        AXUIElementSetMessagingTimeout(element, 0.25)
         self.element = element
         self.pid = pid
         originalFrame = frame
@@ -152,8 +153,11 @@ private final class Animator {
     private func settle() {
         let done = resized
         resized = []
-        if !done.isEmpty { onResized?(done) }
-        onIdle?()
+        // Wait for the apps to finish resizing before reading back what they took.
+        WindowMover.shared.whenIdle { [weak self] in
+            if !done.isEmpty { self?.onResized?(done) }
+            self?.onIdle?()
+        }
     }
 
     private func distance(_ move: Move) -> CGFloat {
@@ -187,8 +191,7 @@ private final class Animator {
         // Resizing makes an app redraw, so only ask when the size really changed since last time.
         let last = move.window.lastSet?.size ?? move.from.size
         let resize = move.window.lastSet == nil || abs(last.width - frame.width) > 0.5 || abs(last.height - frame.height) > 0.5
-        move.window.element.setPosition(frame.origin)
-        if resize { move.window.element.setSize(frame.size) }
+        WindowMover.shared.move(move.window.id, move.window.element, pid: move.window.pid, to: frame, resize: resize)
         move.window.lastSet = frame
         onPlace?(move.window)
     }
@@ -294,6 +297,7 @@ final class WindowManager {
         guard running else { return }
         running = false
         animator.cancel()
+        WindowMover.shared.drain()   // moves still in flight must not land after the restore
         pendingReconcile?.cancel()
         safetyTimer?.invalidate()
         safetyTimer = nil

@@ -28,6 +28,8 @@ final class FocusBorder {
 
     private let window = overlayWindow()
     private let shape = CAShapeLayer()
+    private var target: UInt32?
+    private var watchdog: Timer?
 
     private init() {
         window.level = .normal
@@ -48,10 +50,10 @@ final class FocusBorder {
         let bounds = CGRect(origin: .zero, size: outer.size)
         let ring = CGMutablePath()
         ring.addRoundedRect(in: bounds, cornerWidth: radius + width, cornerHeight: radius + width)
-        // Hollow, so a see-through window is not tinted. The hole stays hidden under the
-        // window: it starts a little inside the edge and is rounder than any real corner.
-        let hole = bounds.insetBy(dx: width + 2, dy: width + 2)
-        let holeRadius = min(radius + 12, hole.width / 2, hole.height / 2)
+        // Hollow, so a see-through window is not tinted. The hole is the window's own outline,
+        // so even in the moment before the border is put back underneath it looks right.
+        let hole = bounds.insetBy(dx: width, dy: width)
+        let holeRadius = min(radius, hole.width / 2, hole.height / 2)
         if hole.width > 0, hole.height > 0 {
             ring.addRoundedRect(in: hole, cornerWidth: holeRadius, cornerHeight: holeRadius)
         }
@@ -70,9 +72,31 @@ final class FocusBorder {
             }
         }
         window.order(.below, relativeTo: Int(id))
+        watch(id)
+    }
+
+    /// Something occasionally lifts the border above its window (a Space switch, Spool's own
+    /// Settings window coming forward). Checks twice a second while it shows, and puts it
+    /// back underneath if so. One window list read, no work when all is well.
+    private func watch(_ id: UInt32) {
+        target = id
+        guard watchdog == nil else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.checkOrder() }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdog = timer
+    }
+
+    private func checkOrder() {
+        guard window.isVisible, let target else { return }
+        let above = (CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow], CGWindowID(window.windowNumber)) as? [[String: Any]]) ?? []
+        let nearest = above.last { ($0[kCGWindowLayer as String] as? Int) == 0 }?[kCGWindowNumber as String] as? Int
+        if nearest != Int(target) { window.order(.below, relativeTo: Int(target)) }
     }
 
     func hide() {
+        watchdog?.invalidate()
+        watchdog = nil
+        target = nil
         if window.isVisible { window.orderOut(nil) }
     }
 }
